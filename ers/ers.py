@@ -55,7 +55,7 @@ def get_forward_filtering_fn(
             log_likelihood, state_filter_prob_prev, t_prev, x_prev = carry_state
             t = t_prev + 1
             # p(x^i_t,y_t | y_1:t-1) = sum_j p(x^j_t-1| y_1:t-1) w(x^j_t-1, x^i_t)
-            weight_matrix = weight_matrix_fn(x_t, x_prev)
+            weight_matrix = weight_matrix_fn(x_prev, x_t)
 
             if bound_indices is not None:
                 bound_i = bound_indices[t]
