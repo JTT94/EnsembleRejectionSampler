@@ -6,13 +6,13 @@ import einops
 
 
 class HardObstacle:
-    def __init__(self, dimension, sigma_v, T, N) -> None:
+    def __init__(self, rng, dimension, sigma_v, T, N) -> None:
         self.dimension = dimension
 
         self.N = N
         self.T = T
         self.sv = sigma_v
-        self.xtrue = self.generate_x()
+        self.xtrue = self.generate_x(rng)
 
         #
         self.w0_bound = 1
@@ -42,15 +42,18 @@ class HardObstacle:
         w = jnp.exp(-logwmin) * jnp.exp(-logw + logwmin) / self.sv
         return w
 
-    def generate_x(self):
+    def generate_x(self, rng):
         # true hidden state
         T = self.T
         d = self.dimension
-        xtrue = np.zeros((T, d))
-        xtrue[0, :] = np.random.randn(d)
+        xtrue = jnp.zeros((T, d))
+        rng, step_rng = jax.random.split(rng)
+        xtrue = xtrue.at[0].set(jax.random.randn(step_rng, (d,)))
         for t in range(1, T):
             x2 = self.push_forward(xtrue[t - 1])
-            xtrue[t] = x2 + self.sv * np.random.randn(d)
+            rng, step_rng = jax.random.split(rng)
+            next_x = x2 + self.sv * jax.random.randn(step_rng, (d,))
+            xtrue = xtrue.at[t].set(next_x)
         return xtrue
 
 
@@ -59,45 +62,66 @@ if __name__ == "__main__":
     import time
     import functools
     import ers
+    import pandas as pd
+    
+    num_trials = 5_000
+    batch_n = 10
+    seed = 0
+    results = []
+    
+    data_rng = jax.random.PRNGKey(0)
+    
+    for T in [100, 250, 500, 1_000]:
+        for N in [T, 2*T, 5*T, 10*T]:
+            for d in [1,2,3]:
+                model = HardObstacle(rng = data_rng, N=N, T=T, dimension=d, sigma_v=0.2)
 
-    model = HardObstacle(N=250, T=250, dimension=1, sigma_v=0.2)
+                transition_prob_fn = jax.vmap(model.single_transition_fn, in_axes=(None, 0))
+                ers_step = ers.get_ers_step(
+                    sample_xs_fn=model.sample_xs_fn,
+                    transition_prob_fn=transition_prob_fn,
+                    w_init_fn=model.w_init_fn,
+                    weight_matrix_fn=model.weight_matrix_fn,
+                    w0_bound=model.w0_bound,
+                    wt_bound=model.wt_bound,
+                    w_prev_bound_fn=model.w_prev_bound_fn,
+                    w_next_bound_fn=model.w_next_bound_fn,
+                )
+                rng = jax.random.PRNGKey(0)
 
-    transition_prob_fn = jax.vmap(model.single_transition_fn, in_axes=(None, 0))
-    ers_step = ers.get_ers_step(
-        sample_xs_fn=model.sample_xs_fn,
-        transition_prob_fn=transition_prob_fn,
-        w_init_fn=model.w_init_fn,
-        weight_matrix_fn=model.weight_matrix_fn,
-        w0_bound=model.w0_bound,
-        wt_bound=model.wt_bound,
-        w_prev_bound_fn=model.w_prev_bound_fn,
-        w_next_bound_fn=model.w_next_bound_fn,
-    )
-    rng = jax.random.PRNGKey(0)
+                jit_ers_step = jax.jit(ers_step)
+                accept, x_traj, ts, x_ind = jit_ers_step(rng)
 
-    jit_ers_step = jax.jit(ers_step)
-    accept, x_traj, ts, x_ind = jit_ers_step(rng)
+                @jax.jit
+                def body_fn(rng):
+                    accept, x_traj, ts, x_ind = jit_ers_step(rng)
+                    return accept
 
-    @jax.jit
-    def body_fn(rng):
-        accept, x_traj, ts, x_ind = jit_ers_step(rng)
-        return accept
+                @functools.partial(jax.jit, static_argnums=(1,))
+                def sample_n(rng, n):
+                    rngs = jax.random.split(rng, n)
+                    rngs = jnp.array(rngs)
+                    return jax.vmap(body_fn)(rngs)
 
-    @functools.partial(jax.jit, static_argnums=(1,))
-    def sample_n(rng, n):
-        rngs = jax.random.split(rng, n)
-        rngs = jnp.array(rngs)
-        return jax.vmap(body_fn)(rngs)
+                _ = sample_n(rng, 1)
+                
+                
+                n_trials = 0 
+                n_accepts = 0
+                tic = time.time()
+                for _ in range(num_trials // batch_n):
+                    rng, rng_step = jax.random.split(rng)
+                    accept = sample_n(rng_step, batch_n)
+                    n_accepts += jnp.sum(accept)
+                    n_trials += len(accept)
+                toc = time.time()
 
-    _ = sample_n(rng, 1)
+                p_acc = n_accepts / n_trials
+                duration = toc - tic
 
-    tic = time.time()
-    accept = sample_n(rng, 1)
-    toc = time.time()
-
-    print(toc - tic)
-    print(jnp.mean(accept))
-    print(accept.shape)
-
-# export PYTHONPATH=/Users/jamesthornton/ers/EnsembleRejectionSampler/ers
-# XLA_FLAGS="--xla_force_host_platform_device_count=8"
+                cols = ['n_trials', 'n_accepts', 'p_acc', 'duration', 'N', 'T', 'd']
+                item = [n_trials, n_accepts.item(), p_acc.item(), duration, N, T, d]
+                results.append(item)
+                df = pd.DataFrame(results, columns = cols)
+                df.to_csv('./hardobstacle_results.csv')
+                print(item)

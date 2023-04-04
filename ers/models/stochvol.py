@@ -66,52 +66,72 @@ if __name__ == "__main__":
     import ers
     import time
     import functools
+    
+    # exp args
+    T = 200
+    N = 6_000
+    num_trials = 1_000
+    batch_n = 10
+    seed = 0
+    
+    fp = "/data/greyostrich/oxwasp/oxwasp18/thornton/EnsembleRejectionSampler/data/sp500returns.csv"
+    
+    results = []
+    for N in [1_000, 2_000, 5_000, 10_000]:
+        for T in [50, 100, 200, 300, 500]:
+            ytrue = pd.read_csv(fp).returns[4200:(4200+T)].values.copy()
+            model = StochasticVolatility(
+                N=N, dimension=1, alpha=0.95, beta=0.7, sigma_v=0.3, ytrue=ytrue
+            )
 
-    fp = "/Users/jamesthornton/ers/EnsembleRejectionSampler/data/sp500returns.csv"
-    ytrue = pd.read_csv(fp).returns[-200:].values.copy()
-    model = StochasticVolatility(
-        N=2_000, dimension=1, alpha=0.95, beta=0.7, sigma_v=0.3, ytrue=ytrue
-    )
+            transition_prob_fn = jax.vmap(model.single_transition_fn, in_axes=(None, 0))
+            ers_step = ers.get_ers_step(
+                sample_xs_fn=model.sample_xs_fn,
+                transition_prob_fn=transition_prob_fn,
+                w_init_fn=model.w_init_fn,
+                weight_matrix_fn=model.weight_matrix_fn,
+                w0_bound=model.w0_bound,
+                wt_bound=model.wt_bound,
+                w_prev_bound_fn=model.w_prev_bound_fn,
+                w_next_bound_fn=model.w_next_bound_fn,
+            )
 
-    transition_prob_fn = jax.vmap(model.single_transition_fn, in_axes=(None, 0))
-    ers_step = ers.get_ers_step(
-        sample_xs_fn=model.sample_xs_fn,
-        transition_prob_fn=transition_prob_fn,
-        w_init_fn=model.w_init_fn,
-        weight_matrix_fn=model.weight_matrix_fn,
-        w0_bound=model.w0_bound,
-        wt_bound=model.wt_bound,
-        w_prev_bound_fn=model.w_prev_bound_fn,
-        w_next_bound_fn=model.w_next_bound_fn,
-    )
-    rng = jax.random.PRNGKey(0)
 
-    # ---------------
-    jit_ers_step = jax.jit(ers_step)
-    accept, x_traj, ts, x_ind = jit_ers_step(rng)
+            # ---------------
+            rng = jax.random.PRNGKey(seed)
+            jit_ers_step = jax.jit(ers_step)
+            accept, x_traj, ts, x_ind = jit_ers_step(rng)
 
-    @jax.jit
-    def body_fn(rng):
-        accept, x_traj, ts, x_ind = jit_ers_step(rng)
-        return accept
+            @jax.jit
+            def body_fn(rng):
+                accept, x_traj, ts, x_ind = jit_ers_step(rng)
+                return accept
 
-    @functools.partial(jax.jit, static_argnums=(1,))
-    def sample_n(rng, n):
-        rngs = jax.random.split(rng, n)
-        rngs = jnp.array(rngs)
-        return jax.vmap(body_fn)(rngs)
+            @functools.partial(jax.jit, static_argnums=(1,))
+            def sample_n(rng, n):
+                rngs = jax.random.split(rng, n)
+                rngs = jnp.array(rngs)
+                return jax.vmap(body_fn)(rngs)
 
-    _ = sample_n(rng, 1)
+            
+            _ = sample_n(rng, 1)
 
-    tic = time.time()
-    accept = sample_n(rng, 100)
-    toc = time.time()
+            n_trials = 0 
+            n_accepts = 0
+            tic = time.time()
+            for _ in range(num_trials // batch_n):
+                rng, rng_step = jax.random.split(rng)
+                accept = sample_n(rng_step, batch_n)
+                n_accepts += jnp.sum(accept)
+                n_trials += len(accept)
+            toc = time.time()
 
-    print(toc - tic)
-    print(jnp.mean(accept))
-    print(accept.shape)
-
-# export PYTHONPATH=/Users/jamesthornton/ers/EnsembleRejectionSampler/ers
-# XLA_FLAGS="--xla_force_host_platform_device_count=8"
-
-# export XLA_FLAGS=--xla_dump_to=/tmp/xla_dump
+            p_acc = n_accepts / n_trials
+            duration = toc - tic
+            
+            cols = ['n_trials', 'n_accepts', 'p_acc', 'duration', 'N', 'T']
+            item = [n_trials, n_accepts.item(), p_acc.item(), duration, N, T]
+            results.append(item)
+            df = pd.DataFrame(results, columns = cols)
+            df.to_csv('./stoch_vol_results.csv')
+            print(item)

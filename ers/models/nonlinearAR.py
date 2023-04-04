@@ -6,7 +6,7 @@ import einops
 
 
 class NonlinearAR:
-    def __init__(self, dimension, alpha, sigma_v, sigma_w, T, N) -> None:
+    def __init__(self, rng, dimension, alpha, sigma_v, sigma_w, T, N) -> None:
         self.dimension = dimension
         if np.isscalar(alpha):
             alpha = np.eye(dimension) * alpha
@@ -16,8 +16,10 @@ class NonlinearAR:
         self.T = T
         self.sv = sigma_v
         self.sw = sigma_w
-        self.xtrue = self.generate_x()
-        self.ytrue = self.generate_y(self.xtrue)
+        
+        x_rng, y_rng = jax.random.split(rng)
+        self.xtrue = self.generate_x(x_rng)
+        self.ytrue = self.generate_y(self.xtrue, y_rng)
 
         #
         self.w0_bound = 1
@@ -51,73 +53,116 @@ class NonlinearAR:
         w = jnp.exp(-logwmin) * jnp.exp(-logw + logwmin) / self.sv
         return w
 
-    def generate_x(self):
+    def generate_x(self, rng):
         # true hidden state
         T = self.T
         d = self.dimension
-        xtrue = np.zeros((T, d))
-        xtrue[0, :] = np.random.randn(d)
+        xtrue = jnp.zeros((T, d))
+        rng, step_rng = jax.random.split(rng)
+        xtrue = xtrue.at[0].set(jax.random.normal(step_rng, (d,)))
         for t in range(1, T):
+            rng, step_rng = jax.random.split(rng)
             x2 = self.push_forward(xtrue[t - 1])
-            xtrue[t] = x2 + self.sv * np.random.randn(d)
+            next_x = x2 + self.sv * jax.random.normal(step_rng, (d,))
+            xtrue = xtrue.at[t].set(next_x)
         return xtrue
 
-    def generate_y(self, x):
+    def generate_y(self, x, rng):
         T = x.shape[0]
         d = self.dimension
-        y = np.zeros((T, d))
-        y[0] = x[0] + self.sw * np.random.randn(1)
+        y = jnp.zeros((T, d))
+        rng, step_rng = jax.random.split(rng)
+        y_0 = x[0] + self.sw * jax.random.normal(step_rng, (d,))
+        y = y.at[0].set(y_0) 
 
         for t in range(1, T):
-            y[t] = x[t] + self.sw * np.random.randn(d)
+            rng, step_rng = jax.random.split(rng)
+            y_next = x[t] + self.sw * jax.random.normal(step_rng, (d,))
+            y = y.at[t].set(y_next) 
         return y
 
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
-
-    model = NonlinearAR(N=500, T=500, dimension=1, alpha=0.9, sigma_v=0.3, sigma_w=0.1)
     import ers
-
-    transition_prob_fn = jax.vmap(model.single_transition_fn, in_axes=(None, 0))
-    ers_step = ers.get_ers_step(
-        sample_xs_fn=model.sample_xs_fn,
-        transition_prob_fn=transition_prob_fn,
-        w_init_fn=model.w_init_fn,
-        weight_matrix_fn=model.weight_matrix_fn,
-        w0_bound=model.w0_bound,
-        wt_bound=model.wt_bound,
-        w_prev_bound_fn=model.w_prev_bound_fn,
-        w_next_bound_fn=model.w_next_bound_fn,
-    )
-    rng = jax.random.PRNGKey(0)
-    jit_ers_step = jax.jit(ers_step)
-    accept, x_traj, ts, x_ind = jit_ers_step(rng)
-
-    @jax.jit
-    def body_fn(rng):
-        accept, x_traj, ts, x_ind = jit_ers_step(rng)
-        return accept
-
     import time
-
     import functools
+    import pandas as pd
+    
+    num_trials = 1_000
+    batch_n = 10
+    seed = 42
+    tag = "_d_trials"
+    
+    if tag == "_d_exp":
+        t_range = [25, 50, 100, 200]
+        n_range = [100, 250, 500, 1_000, 5_000, 10_000]
+        d_range = [1,2, 3, 4, 5, 6, 7, 8]
+        
+    if tag == "_t_exp"
+        t_range = [100, 250, 500, 1_000]
+#         n_range = [T, 2*T, 5*T, 10*T]
+        d_range = [1,2,3]
+        
+    results = []
 
-    @functools.partial(jax.jit, static_argnums=(1,))
-    def sample_n(rng, n):
-        rngs = jax.random.split(rng, n)
-        rngs = jnp.array(rngs)
-        return jax.vmap(body_fn)(rngs)
+    for T in t_range:
+        
+        if tag == "_t_exp":
+            n_range = [T, 2*T, 5*T, 10*T]
+            
+        for N in n_range:
+            for d in d_range:
+                
+                model = NonlinearAR(rng=jax.random.PRNGKey(0), N=N, T=T, dimension=d, alpha=0.9, sigma_v=0.3, sigma_w=0.1)
+                
+                transition_prob_fn = jax.vmap(model.single_transition_fn, in_axes=(None, 0))
+                ers_step = ers.get_ers_step(
+                    sample_xs_fn=model.sample_xs_fn,
+                    transition_prob_fn=transition_prob_fn,
+                    w_init_fn=model.w_init_fn,
+                    weight_matrix_fn=model.weight_matrix_fn,
+                    w0_bound=model.w0_bound,
+                    wt_bound=model.wt_bound,
+                    w_prev_bound_fn=model.w_prev_bound_fn,
+                    w_next_bound_fn=model.w_next_bound_fn,
+                )
+                rng = jax.random.PRNGKey(0)
+                jit_ers_step = jax.jit(ers_step)
+                accept, x_traj, ts, x_ind = jit_ers_step(rng)
 
-    _ = sample_n(rng, 2)
+                @jax.jit
+                def body_fn(rng):
+                    accept, x_traj, ts, x_ind = jit_ers_step(rng)
+                    return accept
 
-    tic = time.time()
-    accept = sample_n(rng, 100)
-    toc = time.time()
+                @functools.partial(jax.jit, static_argnums=(1,))
+                def sample_n(rng, n):
+                    rngs = jax.random.split(rng, n)
+                    rngs = jnp.array(rngs)
+                    return jax.vmap(body_fn)(rngs)
 
-    print(toc - tic)
-    print(jnp.mean(accept))
-    print(accept.shape)
+                _ = sample_n(rng, 2)
 
-# export PYTHONPATH=/Users/jamesthornton/ers
-# XLA_FLAGS="--xla_force_host_platform_device_count=8"
+                n_trials = 0 
+                n_accepts = 0
+                tic = time.time()
+                for _ in range(num_trials // batch_n):
+                    rng, rng_step = jax.random.split(rng)
+                    accept = sample_n(rng_step, batch_n)
+                    n_accepts += jnp.sum(accept)
+                    n_trials += len(accept)
+                toc = time.time()
+
+                p_acc = n_accepts / n_trials
+                duration = toc - tic
+
+                cols = ['n_trials', 'n_accepts', 'p_acc', 'duration', 'N', 'T', 'd']
+                item = [n_trials, n_accepts.item(), p_acc.item(), duration, N, T, d]
+                results.append(item)
+                df = pd.DataFrame(results, columns = cols)
+                df.to_csv(f'./nonlinear_ar_results{tag}.csv')
+                print(item)
+                
+                if n_accepts < 1:
+                    break
